@@ -158,13 +158,19 @@ pub fn write_key(provider: TranslationProvider, key: &str) -> Result<(), String>
     };
     result.map_err(|_| "無法更新 Keychain".into())
 }
-#[cfg(not(target_os = "macos"))]
-pub fn read_key(provider: TranslationProvider) -> Result<Option<String>, String> {
-    Err("目前只支援 macOS Keychain".into())
+#[cfg(target_os = "windows")]
+#[path = "windows_credentials.rs"]
+mod windows_credentials;
+#[cfg(target_os = "windows")]
+pub use windows_credentials::{read_key, write_key};
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn read_key(_: TranslationProvider) -> Result<Option<String>, String> {
+    Err("此平台不支援儲存翻譯憑證".into())
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn write_key(_provider: TranslationProvider, _: &str) -> Result<(), String> {
-    Err("目前只支援 macOS Keychain".into())
+    Err("此平台不支援儲存翻譯憑證".into())
 }
 
 #[cfg(test)]

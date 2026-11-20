@@ -6,6 +6,8 @@ import { usePlaybackControls } from './playbackControls'
 import type { Settings, Candidate, Lyrics } from './types'
 
 const app = useApp()
+const isMac = /Macintosh/.test(navigator.userAgent)
+const credentialStore = isMac ? 'macOS 鑰匙圈' : 'Windows 認證管理員'
 const overlay = new URLSearchParams(location.search).has('overlay')
 const page = ref<'lyrics' | 'settings'>('lyrics')
 const draft = ref<Settings | null>(null)
@@ -96,7 +98,7 @@ async function selectLyrics(candidateId: number) {
 }
 async function saveKey(remove = false) {
   if (!remove && !apiKey.value.trim()) { notice.value = '請先輸入 API key'; return }
-  const saved = await action('save_api_key', { key: remove ? '' : apiKey.value, provider: provider.value }, remove ? '已移除憑證；既有快取仍可使用' : '已安全儲存至 Keychain')
+  const saved = await action('save_api_key', { key: remove ? '' : apiKey.value, provider: provider.value }, remove ? '已移除憑證；既有快取仍可使用' : `已儲存至${credentialStore}`)
   if (saved) {
     apiKey.value = ''
     azureRegionInput.value = ''
@@ -218,12 +220,12 @@ onUnmounted(app.stop)
             <p class="small muted mt-2">填入 Azure「金鑰與端點」中的位置代碼；區域資源必填。</p>
           </template>
         </template>
-        <label class="input-label" for="api-key">API key <span class="key-status">{{ hasKey === true ? '已儲存於 Keychain' : hasKey === false ? '尚未設定' : '' }}</span></label>
+        <label class="input-label" for="api-key">API key <span class="key-status">{{ hasKey === true ? '已儲存' : hasKey === false ? '尚未設定' : '' }}</span></label>
         <input id="api-key" v-model="apiKey" class="key-input" type="password" :placeholder="`貼上你的 ${provider === 'azure' ? 'Azure' : 'Google'} API key`" autocomplete="off" spellcheck="false" :disabled="!app.desktop">
-        <p class="small muted mt-2">憑證只存於 macOS 鑰匙圈，不寫入設定檔。</p>
+        <p class="small muted mt-2">憑證只存於{{ credentialStore }}，不寫入設定檔。</p>
         <div class="flex gap-3 mt-4"><button class="primary flex-1" :disabled="busy || !app.desktop" @click="saveKey()">儲存憑證</button><button class="secondary" :disabled="busy || !hasKey" @click="saveKey(true)">移除</button></div>
         <div class="note mt-5"><strong>開始前</strong><p v-if="provider === 'google'">啟用 Google Cloud Translation API 與計費，再儲存 API key 即可開始翻譯。</p><p v-else>建立 Azure Translator F0 資源，填入 Key 與 Region 即可。</p></div>
-        <div class="mt-auto pt-5"><button class="text-button" :disabled="!app.desktop || busy" @click="action('open_automation_settings')">開啟 macOS 自動化權限設定 ↗</button><p class="small muted mt-2">若讀不到歌曲，請允許此 App 控制 Spotify。</p></div>
+        <div v-if="isMac" class="mt-auto pt-5"><button class="text-button" :disabled="!app.desktop || busy" @click="action('open_automation_settings')">開啟 macOS 自動化權限設定 ↗</button><p class="small muted mt-2">若讀不到歌曲，請允許此 App 控制 Spotify。</p></div>
       </section>
     </div>
     <section v-show="page === 'settings'" class="card mt-5" aria-labelledby="local-data-heading">

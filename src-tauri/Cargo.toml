@@ -21,6 +21,9 @@ sha2 = "0.10"
 httpdate = "1"
 html-escape = "0.2"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Foundation", "Media_Control", "Win32_Foundation", "Win32_Security_Credentials"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
 objc2 = "0.6"

@@ -88,6 +88,8 @@ fn apply_overlay(app: &tauri::AppHandle, settings: &Settings, editing: bool) -> 
         window
             .set_always_on_top(settings.always_on_top)
             .map_err(|e| e.to_string())?;
+        #[cfg(target_os = "windows")]
+        window.set_focusable(editing).map_err(|e| e.to_string())?;
         window
             .set_ignore_cursor_events(settings.click_through && !editing)
             .map_err(|e| e.to_string())?;
@@ -294,7 +296,7 @@ async fn key_status(
         storage::read_key(provider).map(|key| key.is_some())
     })
     .await
-    .map_err(|_| "Keychain 工作失敗".to_string())?
+    .map_err(|_| "無法查詢系統憑證".to_string())?
 }
 #[tauri::command]
 async fn save_api_key(
@@ -314,7 +316,7 @@ async fn save_api_key(
     }
     tauri::async_runtime::spawn_blocking(move || storage::write_key(provider, &key))
         .await
-        .map_err(|_| "Keychain 工作失敗".to_string())??;
+        .map_err(|_| "無法更新系統憑證".to_string())??;
     state.retry.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -415,7 +417,7 @@ async fn load_track(state: Shared, track: Track, generation: u64) {
             let message = match other {
                 Ok(Err(message)) => message,
                 Ok(Ok(None)) => "尚未設定所選服務的 API key，先顯示原文".into(),
-                _ => "無法讀取 Keychain".into(),
+                _ => "無法讀取系統憑證".into(),
             };
             update_current(&state, generation, |data| {
                 data.translation_message = Some(message)
@@ -574,6 +576,7 @@ pub fn run() {
             } else {
                 overlay.center()?;
             }
+            #[cfg(target_os = "macos")]
             overlay.set_visible_on_all_workspaces(true)?;
             #[cfg(target_os = "macos")]
             macos::configure_overlay(&overlay, &settings)?;
@@ -632,10 +635,11 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if window.label() == "main" {
-                if matches!(
-                    event,
-                    tauri::WindowEvent::Focused(false) | tauri::WindowEvent::CloseRequested { .. }
-                ) {
+                let closing = matches!(event, tauri::WindowEvent::CloseRequested { .. });
+                // Windows can give the overlay focus while starting a native drag.
+                let lost_focus = cfg!(target_os = "macos")
+                    && matches!(event, tauri::WindowEvent::Focused(false));
+                if closing || lost_focus {
                     if let Some(state) = window.try_state::<Shared>() {
                         let editing = state.data.lock().unwrap().editing;
                         if editing {

@@ -1,5 +1,15 @@
-use crate::model::{hash, Playback, Track};
-use std::{future::Future, time::Duration};
+use crate::model::Playback;
+#[cfg(any(not(target_os = "windows"), test))]
+use crate::model::{hash, Track};
+use std::future::Future;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+
+#[cfg(target_os = "windows")]
+#[path = "windows_playback.rs"]
+mod windows_playback;
+#[cfg(target_os = "windows")]
+pub use windows_playback::{control, seek};
 
 pub trait PlaybackProvider {
     fn get_state(&self) -> impl Future<Output = Result<Playback, String>> + Send;
@@ -7,6 +17,7 @@ pub trait PlaybackProvider {
 pub struct Spotify;
 
 // Numeric character separators preserve commas, quotes and newlines in song metadata.
+#[cfg(not(target_os = "windows"))]
 const SCRIPT: &str = r#"
 if not (application id "com.spotify.client" is running) then return "unavailable"
 tell application id "com.spotify.client"
@@ -32,6 +43,7 @@ pub enum PlaybackAction {
     Pause,
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 impl PlaybackAction {
     fn command(&self) -> &'static str {
         match self {
@@ -43,6 +55,7 @@ impl PlaybackAction {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 pub async fn control(action: PlaybackAction) -> Result<(), String> {
     let script = format!(
         r#"
@@ -54,6 +67,7 @@ tell application id "com.spotify.client" to {}
     execute(&script).await.map(|_| ())
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn seek_command(position_ms: u64, duration_ms: u64) -> Result<String, String> {
     if duration_ms == 0 || position_ms > duration_ms {
         return Err("播放位置超出歌曲範圍".into());
@@ -65,6 +79,7 @@ fn seek_command(position_ms: u64, duration_ms: u64) -> Result<String, String> {
     ))
 }
 
+#[cfg(not(target_os = "windows"))]
 pub async fn seek(position_ms: u64, duration_ms: u64) -> Result<(), String> {
     let command = seek_command(position_ms, duration_ms)?;
     execute(&format!(r#"
@@ -75,17 +90,21 @@ tell application id "com.spotify.client" to {command}
 
 impl PlaybackProvider for Spotify {
     async fn get_state(&self) -> Result<Playback, String> {
+        #[cfg(target_os = "windows")]
+        return windows_playback::get_state().await;
+        #[cfg(not(target_os = "windows"))]
         parse(&execute(SCRIPT).await?)
     }
 }
 
-async fn execute(script: &str) -> Result<String, String> {
+#[cfg(not(target_os = "windows"))]
+async fn execute(_script: &str) -> Result<String, String> {
     #[cfg(not(target_os = "macos"))]
     return Err("目前只支援 macOS Spotify 桌面版".into());
     #[cfg(target_os = "macos")]
     {
         let mut cmd = tokio::process::Command::new("/usr/bin/osascript");
-        cmd.arg("-e").arg(script).kill_on_drop(true);
+        cmd.arg("-e").arg(_script).kill_on_drop(true);
         let output = tokio::time::timeout(Duration::from_secs(4), cmd.output())
             .await
             .map_err(|_| "Spotify 回應逾時，請檢查自動化權限".to_string())?
@@ -105,6 +124,7 @@ async fn execute(script: &str) -> Result<String, String> {
     }
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn parse(raw: &str) -> Result<Playback, String> {
     let raw = raw.trim_end_matches(['\n', '\r']);
     if raw == "unavailable" {
