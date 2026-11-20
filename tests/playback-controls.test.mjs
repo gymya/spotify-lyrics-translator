@@ -71,3 +71,46 @@ test('switching songs clears pending state and ignores late command completion',
   t.mock.timers.tick(5000)
   assert.equal(c.syncError.value, '')
 })
+
+for (const direction of ['previous', 'next']) {
+  test(`${direction} stays pending through stale polls until the track changes`, async t => {
+    const { controls: c, finish, poll } = setup(t)
+    const request = c.skip(direction)
+    assert.equal(c.position.value, 0)
+    assert.ok(c.switching.value)
+    finish(true); await request
+    await poll({ positionMs: 11000, isPlaying: true })
+    assert.equal(c.pending.value, true)
+    assert.equal(c.position.value, 0)
+    await c.skip(direction) // Ignore duplicate clicks while waiting.
+    await poll({ track: { id: 'new-song' }, positionMs: 500 })
+    assert.equal(c.pending.value, false)
+    assert.equal(c.switching.value, '')
+    assert.equal(c.position.value, 500)
+  })
+}
+
+test('previous can restart the same track without falsely confirming stale progress', async t => {
+  const { controls: c, finish, poll } = setup(t)
+  const request = c.skip('previous')
+  finish(true); await request
+  await poll({ positionMs: 11000 })
+  assert.equal(c.pending.value, true)
+  await poll({ positionMs: 500 })
+  assert.equal(c.pending.value, false)
+})
+
+test('failed or unconfirmed skips restore the current track controls', async t => {
+  const { controls: c, finish } = setup(t)
+  let request = c.skip('next')
+  finish(false); await request
+  assert.equal(c.pending.value, false)
+  assert.equal(c.position.value, 10000)
+  request = c.skip('previous')
+  finish(true); await request
+  t.mock.timers.tick(5000)
+  assert.equal(c.pending.value, false)
+  assert.equal(c.switching.value, '')
+  assert.equal(c.position.value, 10000)
+  assert.ok(c.syncError.value)
+})

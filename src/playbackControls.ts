@@ -1,7 +1,7 @@
 import { computed, onScopeDispose, ref, watch } from 'vue'
 import type { Playback } from './types'
 
-type Target = { kind: 'seek' | 'toggle'; trackId: string | undefined; positionMs: number; isPlaying: boolean; ready: boolean }
+type Target = { kind: 'seek' | 'toggle' | 'previous' | 'next'; fromPositionMs?: number; trackId: string | undefined; positionMs: number; isPlaying: boolean; ready: boolean }
 
 export function usePlaybackControls(
   playback: () => Playback | undefined,
@@ -14,6 +14,7 @@ export function usePlaybackControls(
   const position = computed(() => draggedPosition.value ?? target.value?.positionMs ?? playback()?.positionMs ?? 0)
   const playing = computed(() => target.value?.isPlaying ?? playback()?.isPlaying ?? false)
   const pending = computed(() => target.value !== null)
+  const switching = computed(() => target.value?.kind === 'previous' ? '正在切換上一首…' : target.value?.kind === 'next' ? '正在切換下一首…' : '')
   function clear() {
     clearTimeout(timer)
     target.value = null
@@ -26,7 +27,9 @@ export function usePlaybackControls(
       clear()
     } else if (requested?.ready && (requested.kind === 'seek'
       ? Math.abs(current.positionMs - requested.positionMs) <= 1500
-      : current.isPlaying === requested.isPlaying)) {
+      : requested.kind === 'toggle'
+        ? current.isPlaying === requested.isPlaying
+        : current.positionMs <= 1500 && (requested.fromPositionMs ?? 0) - current.positionMs > 1500)) {
       clear()
     }
     playbackTrackId = current?.track?.id
@@ -59,6 +62,12 @@ export function usePlaybackControls(
     await request({ kind: 'toggle', trackId: playback()?.track?.id, positionMs: position.value, isPlaying, ready: false },
       'control_playback', { action: isPlaying ? 'play' : 'pause' })
   }
+  async function skip(direction: 'previous' | 'next') {
+    const current = playback()
+    if (!current?.track) return
+    await request({ kind: direction, trackId: current.track.id, positionMs: 0, fromPositionMs: current.positionMs, isPlaying: playing.value, ready: false },
+      'control_playback', { action: direction })
+  }
   onScopeDispose(() => clearTimeout(timer))
-  return { position, playing, pending, draggedPosition, syncError, seek, toggle }
+  return { position, playing, pending, draggedPosition, syncError, seek, toggle, skip, switching }
 }
