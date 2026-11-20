@@ -99,3 +99,5 @@ npm run tauri -- dev
 官方參考：[Tauri](https://v2.tauri.app/) · [LRCLIB API](https://lrclib.net/docs) · [Google Basic v2](https://cloud.google.com/translate/docs/reference/rest/v2/translate) · [Google 認證](https://cloud.google.com/translate/docs/authentication)
 
 字幕原文與譯文預設使用半透明黑色背景，可在「浮動歌詞」切換「顯示半透明黑底」，設定會自動儲存；不加描邊或陰影。Azure Region 輸入框在儲存及重開後保持空白，已儲存的區域仍供翻譯使用。原生浮窗透過移動通知保存位置，重啟時保留仍可見的位置。
+
+播放／暫停與進度跳轉會立即顯示操作目標，忽略尚未更新的 Spotify 回報；確認後同步實際狀態，失敗或等待確認逾時則恢復並提示。前端控制測試：`node --test tests/playback-controls.test.mjs`（Node.js 22.18+）。

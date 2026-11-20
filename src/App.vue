@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useApp } from './store'
+import { usePlaybackControls } from './playbackControls'
 import type { Settings } from './types'
 
 const app = useApp()
@@ -14,6 +15,8 @@ const notice = ref('')
 const busy = ref(false)
 const choosingLyrics = ref(false)
 const s = computed(() => app.snapshot)
+const { position, playing, pending, draggedPosition, syncError, seek: seekTo, toggle } = usePlaybackControls(() => s.value?.playback, action)
+watch(syncError, error => { if (error) notice.value = error })
 const provider = computed(() => draft.value?.translationProvider ?? 'google')
 const serviceName = computed(() => provider.value === 'azure' ? 'Microsoft Azure Translator' : 'Google Cloud Translation')
 watch(provider, async () => {
@@ -74,7 +77,7 @@ async function saveKey(remove = false) {
 }
 async function seek(event: Event) {
   if (!track.value) return
-  await action('seek_playback', { trackId: track.value.id, positionMs: Number((event.target as HTMLInputElement).value) })
+  await seekTo(Number((event.target as HTMLInputElement).value))
 }
 async function drag(event: PointerEvent) {
   if (s.value?.editing && event.button === 0) {
@@ -103,24 +106,24 @@ onUnmounted(app.stop)
   <main v-else class="dashboard">
     <header class="flex items-center justify-between gap-4">
       <div class="flex items-center gap-3"><div class="brand-mark">♫</div><div><p class="eyebrow">SPOTIFY LYRICS TRANSLATOR</p></div></div>
-      <span class="badge"><i :class="{ active: s?.playback.isPlaying }"></i>{{ s?.playback.status === 'playing' ? '播放中' : s?.playback.status === 'paused' ? '已暫停' : '等待連線' }}</span>
+      <span class="badge"><i :class="{ active: playing }"></i>{{ playing ? '播放中' : track ? '已暫停' : '等待連線' }}</span>
     </header>
 
     <section class="now-playing card">
       <div class="flex items-start gap-4"><div class="album-mark" aria-hidden="true">♫</div><div class="min-w-0 flex-1"><p class="eyebrow">NOW PLAYING</p><h2 class="track-title">{{ track?.title || '準備好你的下一首歌' }}</h2><p class="muted">{{ track ? `${track.artist} · ${track.album}` : '開啟 Spotify 桌面版，讓翻譯跟著音樂走。' }}</p></div></div>
       <div class="flex items-center justify-center gap-3 mt-4" role="group" aria-label="Spotify 播放控制">
-        <button class="secondary playback-button" title="上一首" aria-label="上一首" :disabled="busy || !app.desktop || !track || s?.playback.status === 'unavailable'" @click="action('control_playback', { action: 'previous' })">
+        <button class="secondary playback-button" title="上一首" aria-label="上一首" :disabled="busy || pending || !app.desktop || !track || s?.playback.status === 'unavailable'" @click="action('control_playback', { action: 'previous' })">
           <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 5h3v14H5zM19 5v14L9 12z" /></svg>
         </button>
-        <button class="primary playback-button" :title="s?.playback.isPlaying ? '暫停' : '播放'" :aria-label="s?.playback.isPlaying ? '暫停' : '播放'" :disabled="busy || !app.desktop || !s || s.playback.status === 'unavailable'" @click="action('control_playback', { action: s?.playback.isPlaying ? 'pause' : 'play' })">
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path v-if="s?.playback.isPlaying" d="M6 5h4v14H6zM14 5h4v14h-4z" /><path v-else d="M8 5v14l11-7z" /></svg>
+        <button class="primary playback-button" :title="playing ? '暫停' : '播放'" :aria-label="playing ? '暫停' : '播放'" :disabled="busy || pending || !app.desktop || !s || s.playback.status === 'unavailable'" @click="toggle">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path v-if="playing" d="M6 5h4v14H6zM14 5h4v14h-4z" /><path v-else d="M8 5v14l11-7z" /></svg>
         </button>
-        <button class="secondary playback-button" title="下一首" aria-label="下一首" :disabled="busy || !app.desktop || !track || s?.playback.status === 'unavailable'" @click="action('control_playback', { action: 'next' })">
+        <button class="secondary playback-button" title="下一首" aria-label="下一首" :disabled="busy || pending || !app.desktop || !track || s?.playback.status === 'unavailable'" @click="action('control_playback', { action: 'next' })">
           <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M16 5h3v14h-3zM5 5l10 7-10 7z" /></svg>
         </button>
       </div>
-      <input class="progress" type="range" aria-label="播放進度" :aria-valuetext="time(s?.playback.positionMs || 0)" min="0" :max="track?.durationMs || 1" step="1000" :value="s?.playback.positionMs || 0" :disabled="busy || !app.desktop || !track || s?.playback.status === 'unavailable'" @change="seek">
-      <div class="flex justify-between time-label"><span>{{ time(s?.playback.positionMs || 0) }}</span><span>{{ time(track?.durationMs || 0) }}</span></div>
+      <input class="progress" type="range" aria-label="播放進度" :aria-valuetext="time(position)" min="0" :max="track?.durationMs || 1" step="1000" :value="position" :disabled="busy || pending || !app.desktop || !track || s?.playback.status === 'unavailable'" @input="draggedPosition = Number(($event.target as HTMLInputElement).value)" @change="seek" @pointercancel="draggedPosition = null">
+      <div class="flex justify-between time-label"><span>{{ time(position) }}</span><span>{{ time(track?.durationMs || 0) }}</span></div>
       <div class="preview lyric-pair" :style="previewStyle">
         <template v-if="s?.line"><p class="original">{{ s.line.original || '♪' }}</p><p class="translated">{{ s.line.translated || (s.translating ? '正在翻譯歌詞…' : '') }}</p></template>
         <p v-else class="status-text">{{ app.error || app.message }}</p>
