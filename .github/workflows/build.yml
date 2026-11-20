@@ -1,0 +1,26 @@
+name: macOS build
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: npm run tauri -- build --bundles app
+      - run: ditto -c -k --sequesterRsrc --keepParent "src-tauri/target/release/bundle/macos/Spotify Lyrics Translator.app" Spotify-Lyrics-Translator-macOS.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Spotify-Lyrics-Translator-macOS
+          path: Spotify-Lyrics-Translator-macOS.zip

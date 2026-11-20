@@ -1,0 +1,1 @@
+{ "identifier": "desktop", "description": "Local settings and lyric overlay", "windows": ["main", "overlay"], "permissions": ["core:default"] }
