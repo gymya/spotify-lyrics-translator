@@ -2,12 +2,35 @@ use crate::model::{Lyrics, Settings, TranslationProvider};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{path::Path, sync::Mutex};
 
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DataKind {
+    Original,
+    Translation,
+    Matches,
+}
+
 pub struct Storage(Mutex<Connection>);
 impl Storage {
     pub fn open(path: &Path) -> Result<Self, String> {
         let db = Connection::open(path).map_err(|e| e.to_string())?;
         db.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS lyric_matches (track_key TEXT PRIMARY KEY, lrclib_id INTEGER NOT NULL, lyrics TEXT NOT NULL); CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);").map_err(|e| e.to_string())?;
         Ok(Self(Mutex::new(db)))
+    }
+    pub fn clear(&self, kind: DataKind) -> Result<(), String> {
+        let mut db = self.0.lock().unwrap();
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        let sql = match kind {
+            DataKind::Original => "DELETE FROM cache WHERE key LIKE 'lrclib:%'",
+            DataKind::Translation => "DELETE FROM cache WHERE key LIKE 'google:%' OR key LIKE 'azure:%'",
+            DataKind::Matches => "DELETE FROM cache WHERE key IN (SELECT 'lrclib:v1:' || track_key FROM lyric_matches)",
+        };
+        tx.execute(sql, []).map_err(|e| e.to_string())?;
+        if matches!(kind, DataKind::Matches) {
+            tx.execute("DELETE FROM lyric_matches", [])
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())
     }
     pub fn get(&self, key: &str) -> Result<Option<Lyrics>, String> {
         let value: Option<String> = self
@@ -147,6 +170,49 @@ pub fn write_key(_provider: TranslationProvider, _: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clearing_data_preserves_other_categories_and_settings() {
+        for kind in [DataKind::Original, DataKind::Translation, DataKind::Matches] {
+            let db = Storage::open(Path::new(":memory:")).unwrap();
+            for key in [
+                "lrclib:v1:selected",
+                "lrclib:v1:other",
+                "google:v2:song",
+                "azure:v3:song",
+            ] {
+                db.put(key, &Lyrics::Instrumental).unwrap();
+            }
+            db.select_lyrics("selected", 123, &Lyrics::Instrumental)
+                .unwrap();
+            db.save_settings(&Settings {
+                offset_ms: 123,
+                ..Settings::default()
+            })
+            .unwrap();
+            db.clear(kind).unwrap();
+            assert_eq!(
+                db.get("lrclib:v1:selected").unwrap().is_some(),
+                matches!(kind, DataKind::Translation)
+            );
+            assert_eq!(
+                db.get("lrclib:v1:other").unwrap().is_some(),
+                !matches!(kind, DataKind::Original)
+            );
+            for key in ["google:v2:song", "azure:v3:song"] {
+                assert_eq!(
+                    db.get(key).unwrap().is_some(),
+                    !matches!(kind, DataKind::Translation)
+                );
+            }
+            assert_eq!(
+                db.selected_lyrics("selected").unwrap().is_some(),
+                !matches!(kind, DataKind::Matches)
+            );
+            assert_eq!(db.settings().unwrap().offset_ms, 123);
+            db.clear(kind).unwrap();
+        }
+    }
+
     #[test]
     fn selected_version_is_persistent_and_replaceable() {
         let db = Storage::open(Path::new(":memory:")).unwrap();

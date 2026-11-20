@@ -26,6 +26,7 @@ struct Runtime {
     playback: Playback,
     observed: Instant,
     lyrics: Option<Lyrics>,
+    search_results: Option<Lyrics>,
     loading: bool,
     translating: bool,
     translation_message: Option<String>,
@@ -157,6 +158,23 @@ fn drag_overlay(
 }
 
 #[tauri::command]
+fn clear_local_data(
+    window: tauri::WebviewWindow,
+    state: State<'_, Shared>,
+    kind: storage::DataKind,
+) -> Result<(), String> {
+    main_only(&window)?;
+    let mut data = state.data.lock().unwrap();
+    state.db.clear(kind)?;
+    // Invalidate pending work without reloading and immediately recreating the cache.
+    data.generation += 1;
+    data.loading = false;
+    data.translating = false;
+    data.translation_message = None;
+    Ok(())
+}
+
+#[tauri::command]
 fn retry(window: tauri::WebviewWindow, state: State<'_, Shared>) -> Result<(), String> {
     main_only(&window)?;
     state.retry.fetch_add(1, Ordering::Relaxed);
@@ -167,7 +185,7 @@ async fn search_lyrics(
     window: tauri::WebviewWindow,
     state: State<'_, Shared>,
     track_id: String,
-) -> Result<(), String> {
+) -> Result<Lyrics, String> {
     main_only(&window)?;
     let (track, generation) = {
         let mut data = state.data.lock().unwrap();
@@ -177,21 +195,23 @@ async fn search_lyrics(
             .clone()
             .filter(|track| track.id == track_id)
             .ok_or("歌曲已切換，請重新搜尋")?;
-        data.generation += 1;
-        data.lyrics = None;
-        data.loading = true;
-        data.translating = false;
-        data.translation_message = None;
+        data.search_results = None;
         (track, data.generation)
     };
-    let result = lyrics::search(&state.api, &track)
-        .await
-        .unwrap_or_else(|message| Lyrics::Error { message });
-    update_current(state.inner(), generation, |data| {
-        data.lyrics = Some(result);
-        data.loading = false;
-    });
-    Ok(())
+    let result = lyrics::search(&state.api, &track).await?;
+    finish_lyric_search(&mut state.data.lock().unwrap(), generation, result)
+}
+
+fn finish_lyric_search(
+    data: &mut Runtime,
+    generation: u64,
+    result: Lyrics,
+) -> Result<Lyrics, String> {
+    if data.generation != generation {
+        return Err("歌曲或設定已更新，請重新搜尋".into());
+    }
+    data.search_results = Some(result.clone());
+    Ok(result)
 }
 
 #[tauri::command]
@@ -209,7 +229,9 @@ fn select_lyrics(
         .as_ref()
         .filter(|track| track.id == track_id)
         .ok_or("歌曲已切換，請重新選擇")?;
-    let Some(Lyrics::Candidates { candidates }) = &data.lyrics else {
+    let Some(Lyrics::Candidates { candidates }) =
+        data.search_results.as_ref().or(data.lyrics.as_ref())
+    else {
         return Err("候選清單已更新，請重新搜尋".into());
     };
     let candidate = candidates
@@ -225,6 +247,7 @@ fn select_lyrics(
         .select_lyrics(&track.cache_key(), candidate.id, lyrics)?;
     data.generation += 1;
     data.lyrics = None;
+    data.search_results = None;
     data.loading = true;
     data.translating = false;
     data.translation_message = None;
@@ -343,11 +366,17 @@ async fn load_track(state: Shared, track: Track, generation: u64) {
             return;
         }
     };
-    let cache_warning = state
-        .db
-        .put(&lyric_key, &result)
-        .err()
-        .map(|_| "無法寫入歌詞快取".to_string());
+    let cache_warning = {
+        let data = state.data.lock().unwrap();
+        if data.generation != generation {
+            return;
+        }
+        state
+            .db
+            .put(&lyric_key, &result)
+            .err()
+            .map(|_| "無法寫入歌詞快取".to_string())
+    };
     update_current(&state, generation, |data| {
         data.lyrics = Some(result.clone());
         data.loading = false;
@@ -356,7 +385,13 @@ async fn load_track(state: Shared, track: Track, generation: u64) {
     if !matches!(result, Lyrics::Synced { .. }) {
         return;
     }
-    let settings = state.data.lock().unwrap().settings.clone();
+    let settings = {
+        let data = state.data.lock().unwrap();
+        if data.generation != generation {
+            return;
+        }
+        data.settings.clone()
+    };
     let provider = settings.translation_provider;
     let translation_key = translation::cache_key(&track, &result, provider);
     match state.db.get(&translation_key) {
@@ -388,16 +423,28 @@ async fn load_track(state: Shared, track: Track, generation: u64) {
             return;
         }
     };
-    update_current(&state, generation, |data| data.translating = true);
+    {
+        let mut data = state.data.lock().unwrap();
+        if data.generation != generation {
+            return;
+        }
+        data.translating = true;
+    }
     let translated =
         translation::translate(&state.api, &result, &key, provider, &settings.azure_region).await;
     match translated {
         Ok(value) => {
-            let warning = state
-                .db
-                .put(&translation_key, &value)
-                .err()
-                .map(|_| "翻譯成功但快取寫入失敗，下次重播可能再次計費".to_string());
+            let warning = {
+                let data = state.data.lock().unwrap();
+                if data.generation != generation {
+                    return;
+                }
+                state
+                    .db
+                    .put(&translation_key, &value)
+                    .err()
+                    .map(|_| "翻譯成功但快取寫入失敗，下次重播可能再次計費".to_string())
+            };
             update_current(&state, generation, |data| {
                 data.lyrics = Some(value);
                 data.translating = false;
@@ -437,6 +484,7 @@ async fn coordinate(state: Shared) {
             if changed {
                 data.generation += 1;
                 data.lyrics = None;
+                data.search_results = None;
                 data.loading = data.playback.track.is_some();
                 data.translating = false;
                 data.translation_message = None;
@@ -473,6 +521,7 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            clear_local_data,
             save_settings,
             set_editing,
             drag_overlay,
@@ -498,6 +547,7 @@ pub fn run() {
                     playback: Playback::default(),
                     observed: Instant::now(),
                     lyrics: None,
+                    search_results: None,
                     loading: false,
                     translating: false,
                     translation_message: None,
@@ -610,4 +660,43 @@ pub fn run() {
                 show_settings(app);
             }
         });
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn searching_preserves_active_lyrics_and_rejects_stale_results() {
+        let original = Lyrics::Synced {
+            lines: vec![model::Line {
+                start_time_ms: 0,
+                original: "Original".into(),
+                translated: Some("原文".into()),
+            }],
+        };
+        let mut data = Runtime {
+            playback: Playback::default(),
+            observed: Instant::now(),
+            lyrics: Some(original.clone()),
+            search_results: None,
+            loading: false,
+            translating: true,
+            translation_message: None,
+            settings: Settings::default(),
+            editing: false,
+            generation: 1,
+        };
+        let candidates = Lyrics::Candidates { candidates: vec![] };
+        assert_eq!(
+            finish_lyric_search(&mut data, 1, candidates.clone()).unwrap(),
+            candidates
+        );
+        assert_eq!(data.lyrics, Some(original.clone()));
+        assert!(data.translating);
+        assert!(!data.loading);
+        assert!(finish_lyric_search(&mut data, 0, Lyrics::NotFound).is_err());
+        assert_eq!(data.search_results, Some(candidates));
+        assert_eq!(data.lyrics, Some(original));
+    }
 }

@@ -3,10 +3,11 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useApp } from './store'
 import { usePlaybackControls } from './playbackControls'
-import type { Settings } from './types'
+import type { Settings, Candidate, Lyrics } from './types'
 
 const app = useApp()
 const overlay = new URLSearchParams(location.search).has('overlay')
+const page = ref<'lyrics' | 'settings'>('lyrics')
 const draft = ref<Settings | null>(null)
 const apiKey = ref('')
 const azureRegionInput = ref('')
@@ -14,6 +15,19 @@ const hasKey = ref<boolean | null>(null)
 const notice = ref('')
 const busy = ref(false)
 const choosingLyrics = ref(false)
+const searchedCandidates = ref<Candidate[]>([])
+const candidates = computed(() => searchedCandidates.value.length ? searchedCandidates.value : s.value?.lyrics?.kind === 'candidates' ? s.value.lyrics.candidates : [])
+const dataActions = [
+  { kind: 'original', label: '清除原文歌詞快取', detail: '清除全部歌曲的原文快取；下次載入重新抓取。手動指定的版本仍會保留。' },
+  { kind: 'translation', label: '清除翻譯快取', detail: '清除 Google 與 Azure 的全部翻譯快取；下次翻譯會重新呼叫 API，可能計費。' },
+  { kind: 'matches', label: '重設手動選擇的歌詞版本', detail: '移除全部手動選擇紀錄與對應的原文快取；下次重新自動配對，可能需要重新選擇。此操作無法復原。' },
+] as const
+const pendingClear = ref<typeof dataActions[number] | null>(null)
+async function clearLocalData() {
+  const selected = pendingClear.value
+  if (!selected) return
+  if (await action('clear_local_data', { kind: selected.kind }, `${selected.label}完成；下次載入生效`)) pendingClear.value = null
+}
 const s = computed(() => app.snapshot)
 const { position, playing, pending, draggedPosition, syncError, seek: seekTo, toggle } = usePlaybackControls(() => s.value?.playback, action)
 watch(syncError, error => { if (error) notice.value = error })
@@ -54,16 +68,30 @@ async function action(command: string, args?: Record<string, unknown>, success =
   catch (error) { notice.value = String(error); return false }
   finally { busy.value = false }
 }
-watch(() => track.value?.id, () => { choosingLyrics.value = false })
+watch(() => track.value?.id, () => { choosingLyrics.value = false; searchedCandidates.value = [] })
 watch(() => s.value?.lyrics?.kind, kind => {
   if (kind === 'candidates') choosingLyrics.value = true
-  else if (kind && kind !== 'error') choosingLyrics.value = false
 })
 async function toggleLyrics() {
   if (choosingLyrics.value) { choosingLyrics.value = false; return }
   choosingLyrics.value = true
-  if (track.value && s.value?.lyrics?.kind !== 'candidates') {
-    await action('search_lyrics', { trackId: track.value.id })
+  if (!track.value || s.value?.lyrics?.kind === 'candidates') return
+  const trackId = track.value.id
+  searchedCandidates.value = []
+  busy.value = true; notice.value = ''
+  try {
+    const result = await invoke<Lyrics>('search_lyrics', { trackId })
+    if (track.value?.id !== trackId) return
+    if (result.kind === 'candidates') searchedCandidates.value = result.candidates
+    else notice.value = '找不到其他歌詞版本，保留目前歌詞'
+  } catch (error) { notice.value = String(error) }
+  finally { busy.value = false }
+}
+async function selectLyrics(candidateId: number) {
+  if (!track.value) return
+  if (await action('select_lyrics', { trackId: track.value.id, candidateId }, '已記住這首歌的歌詞版本')) {
+    choosingLyrics.value = false
+    searchedCandidates.value = []
   }
 }
 async function saveKey(remove = false) {
@@ -109,7 +137,12 @@ onUnmounted(app.stop)
       <span class="badge"><i :class="{ active: playing }"></i>{{ playing ? '播放中' : track ? '已暫停' : '等待連線' }}</span>
     </header>
 
-    <section class="now-playing card">
+    <nav class="flex gap-3 mt-5" aria-label="主要頁面">
+      <button :class="page === 'lyrics' ? 'primary' : 'secondary'" :aria-current="page === 'lyrics' ? 'page' : undefined" @click="page = 'lyrics'">歌詞</button>
+      <button :class="page === 'settings' ? 'primary' : 'secondary'" :aria-current="page === 'settings' ? 'page' : undefined" @click="page = 'settings'">設定</button>
+    </nav>
+
+    <section v-show="page === 'lyrics'" class="now-playing card" aria-label="歌詞與播放控制">
       <div class="flex items-start gap-4"><div class="album-mark" aria-hidden="true">♫</div><div class="min-w-0 flex-1"><p class="eyebrow">NOW PLAYING</p><h2 class="track-title">{{ track?.title || '準備好你的下一首歌' }}</h2><p class="muted">{{ track ? `${track.artist} · ${track.album}` : '開啟 Spotify 桌面版，讓翻譯跟著音樂走。' }}</p></div></div>
       <div class="flex items-center justify-center gap-3 mt-4" role="group" aria-label="Spotify 播放控制">
         <button class="secondary playback-button" title="上一首" aria-label="上一首" :disabled="busy || pending || !app.desktop || !track || s?.playback.status === 'unavailable'" @click="action('control_playback', { action: 'previous' })">
@@ -132,23 +165,23 @@ onUnmounted(app.stop)
       <div v-if="track" class="mt-4">
         <button class="text-button" :disabled="busy || s?.loading" @click="toggleLyrics">{{ choosingLyrics ? '關閉選擇其他版本' : '選擇其他歌詞版本' }}</button>
       </div>
-      <div v-if="choosingLyrics && s?.lyrics?.kind === 'candidates'" class="candidate-list mt-4">
+      <div v-if="choosingLyrics && candidates.length" class="candidate-list mt-4">
         <h2>選擇正確的歌詞版本</h2>
         <p class="small muted mt-2">以下版本與歌曲長度相差不超過 2 秒。請確認歌手與專輯；選擇後會記住對應，並使用已設定的翻譯服務。</p>
         <ul class="mt-3">
-          <li v-for="candidate in s.lyrics.candidates" :key="candidate.id" class="candidate-row">
+          <li v-for="candidate in candidates" :key="candidate.id" class="candidate-row">
             <div class="min-w-0">
               <p class="candidate-title">{{ candidate.title }}</p>
               <p class="small muted">{{ candidate.artist }} · {{ candidate.album || '未提供專輯' }}</p>
               <p class="small muted">{{ time(candidate.durationMs) }} · {{ candidate.kind === 'synced' ? '同步歌詞' : candidate.kind === 'unsynced' ? '僅文字歌詞' : '純音樂' }}</p>
             </div>
-            <button class="secondary shrink-0" :disabled="busy || !track" @click="action('select_lyrics', { trackId: track!.id, candidateId: candidate.id }, '已記住這首歌的歌詞版本')">使用此版本</button>
+            <button class="secondary shrink-0" :disabled="busy || !track" @click="selectLyrics(candidate.id)">使用此版本</button>
           </li>
         </ul>
       </div>
     </section>
 
-    <div class="settings-grid">
+    <div v-show="page === 'settings'" class="settings-grid" aria-label="歌詞與翻譯設定">
       <section class="card">
         <div class="section-heading"><h2>浮動歌詞</h2><span class="eyebrow">OVERLAY</span></div>
         <template v-if="draft">
@@ -192,6 +225,22 @@ onUnmounted(app.stop)
         <div class="mt-auto pt-5"><button class="text-button" :disabled="!app.desktop || busy" @click="action('open_automation_settings')">開啟 macOS 自動化權限設定 ↗</button><p class="small muted mt-2">若讀不到歌曲，請允許此 App 控制 Spotify。</p></div>
       </section>
     </div>
+    <section v-show="page === 'settings'" class="card mt-5" aria-labelledby="local-data-heading">
+      <div class="section-heading"><h2 id="local-data-heading">本機資料管理</h2><span class="eyebrow">LOCAL DATA</span></div>
+      <p class="small muted mt-2">作用於全部歌曲。保留目前顯示的歌詞，下次載入生效；設定與 API key 不受影響。</p>
+      <div class="flex flex-wrap gap-3 mt-4">
+        <button v-for="item in dataActions" :key="item.kind" class="secondary" :disabled="busy || !app.desktop" @click="pendingClear = item">{{ item.label }}</button>
+      </div>
+      <div v-if="pendingClear" class="note mt-4" role="group" aria-label="確認清除本機資料">
+        <strong>{{ pendingClear.label }}？</strong>
+        <p>{{ pendingClear.detail }}</p>
+        <p class="small muted">已送出的翻譯請求可能仍會計費，但不會寫回已清除的快取。</p>
+        <div class="flex gap-3 mt-3">
+          <button class="secondary" :disabled="busy" @click="pendingClear = null">取消</button>
+          <button class="primary" :disabled="busy || !app.desktop" @click="clearLocalData">確認清除</button>
+        </div>
+      </div>
+    </section>
     <p v-if="notice || app.error" class="notice" role="status">{{ notice || app.error }}</p>
     <footer>關閉此視窗後，App 仍在選單列執行。</footer>
   </main>
