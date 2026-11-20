@@ -8,28 +8,47 @@ const app = useApp()
 const overlay = new URLSearchParams(location.search).has('overlay')
 const draft = ref<Settings | null>(null)
 const apiKey = ref('')
+const azureRegionInput = ref('')
 const hasKey = ref<boolean | null>(null)
 const notice = ref('')
 const busy = ref(false)
 const choosingLyrics = ref(false)
 const s = computed(() => app.snapshot)
+const provider = computed(() => draft.value?.translationProvider ?? 'google')
+const serviceName = computed(() => provider.value === 'azure' ? 'Microsoft Azure Translator' : 'Google Cloud Translation')
+watch(provider, async () => {
+  apiKey.value = ''; hasKey.value = null
+  await refreshKeyStatus()
+})
+async function refreshKeyStatus() {
+  if (overlay || !app.desktop) return
+  const selected = provider.value
+  try {
+    const value = await invoke<boolean>('key_status', { provider: selected })
+    if (selected === provider.value) hasKey.value = value
+  } catch (error) { notice.value = String(error) }
+}
 const track = computed(() => s.value?.playback.track)
-const previewStyle = computed(() => ({ opacity: draft.value?.opacity ?? s.value?.settings.opacity ?? 0.92, fontSize: `${draft.value?.fontSize ?? s.value?.settings.fontSize ?? 26}px` }))
-const overlayStyle = computed(() => ({ opacity: s.value?.settings.opacity ?? 0.92, fontSize: `${s.value?.settings.fontSize ?? 26}px` }))
+const previewStyle = computed(() => ({ '--subtitle-background': (draft.value?.subtitleBackground ?? s.value?.settings.subtitleBackground ?? true) ? 'rgb(0 0 0 / 70%)' : 'transparent', '--original-color': draft.value?.originalColor ?? s.value?.settings.originalColor, '--translated-color': draft.value?.translatedColor ?? s.value?.settings.translatedColor, opacity: draft.value?.opacity ?? s.value?.settings.opacity ?? 0.92, fontSize: `${draft.value?.fontSize ?? s.value?.settings.fontSize ?? 26}px` }))
+const overlayStyle = computed(() => ({ '--subtitle-background': (s.value?.settings.subtitleBackground ?? true) ? 'rgb(0 0 0 / 70%)' : 'transparent', '--original-color': s.value?.settings.originalColor, '--translated-color': s.value?.settings.translatedColor, opacity: s.value?.settings.opacity ?? 0.92, fontSize: `${s.value?.settings.fontSize ?? 26}px` }))
 function time(ms: number) { const seconds = Math.floor(ms / 1000); return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` }
-watch(() => s.value?.settings, value => { if (value && !draft.value) draft.value = { ...value } })
+watch(() => s.value?.settings, value => {
+  if (value && !draft.value) {
+    draft.value = { ...value }
+  }
+})
 watch(draft, (value, previous, onCleanup) => {
   if (!value || !previous || overlay) return
   const settings = { ...value }
   const timer = setTimeout(() => {
-    invoke('save_settings', { settings }).catch(error => { notice.value = `無法儲存顯示設定：${String(error)}` })
+    invoke('save_settings', { settings }).catch(error => { notice.value = `無法儲存設定：${String(error)}` })
   }, 100)
   onCleanup(() => clearTimeout(timer))
 }, { deep: true })
 async function action(command: string, args?: Record<string, unknown>, success = '') {
   busy.value = true; notice.value = ''
-  try { await invoke(command, args); notice.value = success }
-  catch (error) { notice.value = String(error) }
+  try { await invoke(command, args); notice.value = success; return true }
+  catch (error) { notice.value = String(error); return false }
   finally { busy.value = false }
 }
 watch(() => track.value?.id, () => { choosingLyrics.value = false })
@@ -46,9 +65,16 @@ async function toggleLyrics() {
 }
 async function saveKey(remove = false) {
   if (!remove && !apiKey.value.trim()) { notice.value = '請先輸入 API key'; return }
-  await action('save_api_key', { key: remove ? '' : apiKey.value }, remove ? '已移除憑證；既有快取仍可使用' : '已安全儲存至 Keychain')
-  apiKey.value = ''
-  try { hasKey.value = await invoke<boolean>('key_status') } catch (error) { notice.value = String(error) }
+  const saved = await action('save_api_key', { key: remove ? '' : apiKey.value, provider: provider.value }, remove ? '已移除憑證；既有快取仍可使用' : '已安全儲存至 Keychain')
+  if (saved) {
+    apiKey.value = ''
+    azureRegionInput.value = ''
+  }
+  await refreshKeyStatus()
+}
+async function seek(event: Event) {
+  if (!track.value) return
+  await action('seek_playback', { trackId: track.value.id, positionMs: Number((event.target as HTMLInputElement).value) })
 }
 async function drag(event: PointerEvent) {
   if (s.value?.editing && event.button === 0) {
@@ -58,7 +84,7 @@ async function drag(event: PointerEvent) {
 onMounted(() => {
   document.documentElement.classList.toggle('overlay-page', overlay)
   app.poll()
-  if (!overlay && app.desktop) invoke<boolean>('key_status').then(value => hasKey.value = value).catch(error => notice.value = String(error))
+  void refreshKeyStatus()
 })
 onUnmounted(app.stop)
 </script>
@@ -93,13 +119,13 @@ onUnmounted(app.stop)
           <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M16 5h3v14h-3zM5 5l10 7-10 7z" /></svg>
         </button>
       </div>
-      <div class="progress"><div :style="{ width: `${track ? Math.min(100, (s!.playback.positionMs / track.durationMs) * 100) : 0}%` }"></div></div>
+      <input class="progress" type="range" aria-label="播放進度" :aria-valuetext="time(s?.playback.positionMs || 0)" min="0" :max="track?.durationMs || 1" step="1000" :value="s?.playback.positionMs || 0" :disabled="busy || !app.desktop || !track || s?.playback.status === 'unavailable'" @change="seek">
       <div class="flex justify-between time-label"><span>{{ time(s?.playback.positionMs || 0) }}</span><span>{{ time(track?.durationMs || 0) }}</span></div>
       <div class="preview lyric-pair" :style="previewStyle">
         <template v-if="s?.line"><p class="original">{{ s.line.original || '♪' }}</p><p class="translated">{{ s.line.translated || (s.translating ? '正在翻譯歌詞…' : '') }}</p></template>
         <p v-else class="status-text">{{ app.error || app.message }}</p>
       </div>
-      <div class="flex items-center justify-between gap-3"><p class="small muted">{{ s?.translationMessage || (s?.translating ? '正在翻譯歌詞…' : 'LRCLIB 歌詞 · Google 翻譯 · 繁體中文') }}</p><button :disabled="busy || !app.desktop" class="text-button shrink-0" @click="action('retry', undefined, '已安排重新載入')">重新載入 ↻</button></div>
+      <div class="flex items-center justify-between gap-3"><p class="small muted">{{ s?.translationMessage || (s?.translating ? '正在翻譯歌詞…' : `LRCLIB 歌詞 · ${serviceName} · 繁體中文`) }}</p><button :disabled="busy || !app.desktop" class="text-button shrink-0" @click="action('retry', undefined, '已安排重新載入')">重新載入 ↻</button></div>
       <div v-if="track" class="mt-4">
         <button class="text-button" :disabled="busy || s?.loading" @click="toggleLyrics">{{ choosingLyrics ? '關閉選擇其他版本' : '選擇其他歌詞版本' }}</button>
       </div>
@@ -128,6 +154,9 @@ onUnmounted(app.stop)
           <input id="opacity" v-model.number="draft.opacity" type="range" min="0.1" max="1" step="0.01">
           <label class="range-label" for="font">字體大小 <span>{{ draft.fontSize }} px</span></label>
           <input id="font" v-model.number="draft.fontSize" type="range" min="14" max="48" step="1">
+          <label class="toggle-row"><span>顯示半透明黑底</span><input v-model="draft.subtitleBackground" type="checkbox"></label>
+          <label class="toggle-row"><span>原文字體顏色</span><input v-model="draft.originalColor" type="color"></label>
+          <label class="toggle-row"><span>譯文字體顏色</span><input v-model="draft.translatedColor" type="color"></label>
           <label class="range-label" for="offset">時間偏移 <span>{{ draft.offsetMs > 0 ? '+' : '' }}{{ draft.offsetMs }} ms</span></label>
           <input id="offset" v-model.number="draft.offsetMs" type="range" min="-10000" max="10000" step="100">
           <p class="small muted">正值提早顯示，負值延後顯示。</p>
@@ -140,13 +169,23 @@ onUnmounted(app.stop)
 
       <section class="card flex flex-col">
         <div class="section-heading"><h2>翻譯服務</h2><span class="eyebrow">TRANSLATION</span></div>
-        <div class="service-row"><span class="google-mark">G</span><div><strong>Google Cloud Translation</strong><p class="small muted">Basic v2 · 自備 API key</p></div></div>
-        <p class="small description">整首歌曲批次翻譯成繁體中文，並儲存在本機。重播時優先使用快取。</p>
+        <template v-if="draft">
+          <label class="input-label" for="translation-provider">翻譯服務</label>
+          <select id="translation-provider" v-model="draft.translationProvider" class="key-input" :disabled="busy || !app.desktop">
+            <option value="google">Google Cloud Translation Basic v2</option>
+            <option value="azure">Microsoft Azure Translator（支援 F0）</option>
+          </select>
+          <template v-if="provider === 'azure'">
+            <label class="input-label mt-3" for="azure-region">Azure Region</label>
+            <input id="azure-region" v-model.trim="azureRegionInput" @change="draft.azureRegion = azureRegionInput" class="key-input" placeholder="例如 eastasia；Global 資源可留空" autocomplete="off" spellcheck="false" :disabled="busy || !app.desktop">
+            <p class="small muted mt-2">填入 Azure「金鑰與端點」中的位置代碼；區域資源必填。</p>
+          </template>
+        </template>
         <label class="input-label" for="api-key">API key <span class="key-status">{{ hasKey === true ? '已儲存於 Keychain' : hasKey === false ? '尚未設定' : '' }}</span></label>
-        <input id="api-key" v-model="apiKey" class="key-input" type="password" placeholder="貼上你的 Google API key" autocomplete="off" spellcheck="false" :disabled="!app.desktop">
+        <input id="api-key" v-model="apiKey" class="key-input" type="password" :placeholder="`貼上你的 ${provider === 'azure' ? 'Azure' : 'Google'} API key`" autocomplete="off" spellcheck="false" :disabled="!app.desktop">
         <p class="small muted mt-2">憑證只存於 macOS 鑰匙圈，不寫入設定檔。</p>
         <div class="flex gap-3 mt-4"><button class="primary flex-1" :disabled="busy || !app.desktop" @click="saveKey()">儲存憑證</button><button class="secondary" :disabled="busy || !hasKey" @click="saveKey(true)">移除</button></div>
-        <div class="note mt-5"><strong>開始前</strong><p>在 Google Cloud 啟用 Cloud Translation API 與計費。儲存 key 後會自動翻譯目前歌曲，費用由你的 Google 專案負擔。</p></div>
+        <div class="note mt-5"><strong>開始前</strong><p v-if="provider === 'google'">啟用 Google Cloud Translation API 與計費，再儲存 API key 即可開始翻譯。</p><p v-else>建立 Azure Translator F0 資源，填入 Key 與 Region 即可。</p></div>
         <div class="mt-auto pt-5"><button class="text-button" :disabled="!app.desktop || busy" @click="action('open_automation_settings')">開啟 macOS 自動化權限設定 ↗</button><p class="small muted mt-2">若讀不到歌曲，請允許此 App 控制 Spotify。</p></div>
       </section>
     </div>

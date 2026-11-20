@@ -7,7 +7,7 @@ mod storage;
 mod sync;
 mod translation;
 
-use model::{Lyrics, Playback, Settings, Snapshot, Track};
+use model::{Lyrics, Playback, Settings, Snapshot, Track, TranslationProvider};
 use playback::PlaybackProvider;
 use std::{
     sync::{
@@ -115,6 +115,12 @@ fn save_settings(
     settings.panel_y = data.settings.panel_y;
     apply_overlay(&app, &settings, data.editing)?;
     state.db.save_settings(&settings)?;
+    if data.settings.translation_provider != settings.translation_provider
+        || data.settings.azure_region != settings.azure_region
+    {
+        data.generation += 1;
+        state.retry.fetch_add(1, Ordering::Relaxed);
+    }
     data.settings = settings;
     Ok(())
 }
@@ -236,17 +242,43 @@ async fn control_playback(
 }
 
 #[tauri::command]
-async fn key_status(window: tauri::WebviewWindow) -> Result<bool, String> {
+async fn seek_playback(
+    window: tauri::WebviewWindow,
+    state: State<'_, Shared>,
+    track_id: String,
+    position_ms: u64,
+) -> Result<(), String> {
     main_only(&window)?;
-    tauri::async_runtime::spawn_blocking(|| storage::read_key().map(|key| key.is_some()))
-        .await
-        .map_err(|_| "Keychain 工作失敗".to_string())?
+    let duration = {
+        let data = state.data.lock().unwrap();
+        data.playback
+            .track
+            .as_ref()
+            .filter(|track| track.id == track_id)
+            .ok_or("歌曲已切換，請重試")?
+            .duration_ms
+    };
+    playback::seek(position_ms, duration).await
+}
+
+#[tauri::command]
+async fn key_status(
+    window: tauri::WebviewWindow,
+    provider: TranslationProvider,
+) -> Result<bool, String> {
+    main_only(&window)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        storage::read_key(provider).map(|key| key.is_some())
+    })
+    .await
+    .map_err(|_| "Keychain 工作失敗".to_string())?
 }
 #[tauri::command]
 async fn save_api_key(
     window: tauri::WebviewWindow,
     state: State<'_, Shared>,
     key: String,
+    provider: TranslationProvider,
 ) -> Result<(), String> {
     main_only(&window)?;
     let key = key.trim().to_string();
@@ -257,7 +289,7 @@ async fn save_api_key(
     {
         return Err("API key 格式無效".into());
     }
-    tauri::async_runtime::spawn_blocking(move || storage::write_key(&key))
+    tauri::async_runtime::spawn_blocking(move || storage::write_key(provider, &key))
         .await
         .map_err(|_| "Keychain 工作失敗".to_string())??;
     state.retry.fetch_add(1, Ordering::Relaxed);
@@ -324,7 +356,9 @@ async fn load_track(state: Shared, track: Track, generation: u64) {
     if !matches!(result, Lyrics::Synced { .. }) {
         return;
     }
-    let translation_key = translation::cache_key(&track, &result);
+    let settings = state.data.lock().unwrap().settings.clone();
+    let provider = settings.translation_provider;
+    let translation_key = translation::cache_key(&track, &result, provider);
     match state.db.get(&translation_key) {
         Ok(Some(cached)) => {
             update_current(&state, generation, |data| data.lyrics = Some(cached));
@@ -339,13 +373,13 @@ async fn load_track(state: Shared, track: Track, generation: u64) {
         }
         _ => {}
     }
-    let key = tauri::async_runtime::spawn_blocking(storage::read_key).await;
+    let key = tauri::async_runtime::spawn_blocking(move || storage::read_key(provider)).await;
     let key = match key {
         Ok(Ok(Some(key))) => key,
         other => {
             let message = match other {
                 Ok(Err(message)) => message,
-                Ok(Ok(None)) => "尚未設定 Google API key，先顯示原文".into(),
+                Ok(Ok(None)) => "尚未設定所選服務的 API key，先顯示原文".into(),
                 _ => "無法讀取 Keychain".into(),
             };
             update_current(&state, generation, |data| {
@@ -355,7 +389,8 @@ async fn load_track(state: Shared, track: Track, generation: u64) {
         }
     };
     update_current(&state, generation, |data| data.translating = true);
-    let translated = translation::translate(&state.api, &result, &key).await;
+    let translated =
+        translation::translate(&state.api, &result, &key, provider, &settings.azure_region).await;
     match translated {
         Ok(value) => {
             let warning = state
@@ -445,6 +480,7 @@ pub fn run() {
             search_lyrics,
             select_lyrics,
             control_playback,
+            seek_playback,
             key_status,
             save_api_key,
             open_automation_settings

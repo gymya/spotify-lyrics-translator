@@ -1,12 +1,16 @@
 use crate::{
     lyrics::{check_status, reserve, Api},
-    model::{hash, Lyrics, Track},
+    model::{hash, Lyrics, Track, TranslationProvider},
 };
 use serde::Deserialize;
 
-pub fn cache_key(track: &Track, lyrics: &Lyrics) -> String {
+pub fn cache_key(track: &Track, lyrics: &Lyrics, provider: TranslationProvider) -> String {
     format!(
-        "google:v2:zh-TW:{}:{}",
+        "{}:{}:{}",
+        match provider {
+            TranslationProvider::Google => "google:v2:zh-TW",
+            TranslationProvider::Azure => "azure:v3:zh-Hant",
+        },
         track.cache_key(),
         hash(&serde_json::to_string(lyrics).expect("lyrics serialization"))
     )
@@ -25,7 +29,13 @@ struct Translated {
     translated_text: String,
 }
 
-fn api_error(status: u16, summary: &str, body: Option<&serde_json::Value>, key: &str) -> String {
+fn api_error(
+    provider: TranslationProvider,
+    status: u16,
+    summary: &str,
+    body: Option<&serde_json::Value>,
+    key: &str,
+) -> String {
     let error = body.and_then(|body| body.get("error"));
     let message = error
         .and_then(|error| error.get("message"))
@@ -33,7 +43,11 @@ fn api_error(status: u16, summary: &str, body: Option<&serde_json::Value>, key: 
     let code = error
         .and_then(|error| error.get("status"))
         .and_then(|value| value.as_str());
-    let mut text = format!("Google Translation（HTTP {status}）：{summary}");
+    let service = match provider {
+        TranslationProvider::Google => "Google Translation",
+        TranslationProvider::Azure => "Azure Translator",
+    };
+    let mut text = format!("{service}（HTTP {status}）：{summary}");
     if let Some(code) = code {
         text.push_str(&format!(" [{code}]"));
     }
@@ -70,7 +84,13 @@ fn batches(texts: &[String]) -> Result<Vec<std::ops::Range<usize>>, String> {
     Ok(batches)
 }
 
-pub async fn translate(api: &Api, lyrics: &Lyrics, key: &str) -> Result<Lyrics, String> {
+pub async fn translate(
+    api: &Api,
+    lyrics: &Lyrics,
+    key: &str,
+    provider: TranslationProvider,
+    region: &str,
+) -> Result<Lyrics, String> {
     let Lyrics::Synced { lines } = lyrics else {
         return Ok(lyrics.clone());
     };
@@ -84,43 +104,142 @@ pub async fn translate(api: &Api, lyrics: &Lyrics, key: &str) -> Result<Lyrics, 
     let texts: Vec<String> = indices.iter().map(|&i| lines[i].original.clone()).collect();
     for range in batches(&texts)? {
         reserve(&api.translation_after).await?;
-        let response = api.client.post("https://translation.googleapis.com/language/translate/v2")
-            .header("X-Goog-Api-Key", key)
-            .json(&serde_json::json!({ "q": &texts[range.clone()], "target": "zh-TW", "format": "text" }))
-            .send().await.map_err(|_| "翻譯網路連線失敗")?;
+        let request = match provider {
+            TranslationProvider::Google => api.client.post("https://translation.googleapis.com/language/translate/v2")
+                .header("X-Goog-Api-Key", key)
+                .json(&serde_json::json!({ "q": &texts[range.clone()], "target": "zh-TW", "format": "text" })),
+            TranslationProvider::Azure => {
+                let mut request = api.client.post("https://api.cognitive.microsofttranslator.com/translate")
+                    .query(&[("api-version", "3.0"), ("to", "zh-Hant"), ("textType", "plain")])
+                    .header("Ocp-Apim-Subscription-Key", key)
+                    .json(&texts[range.clone()].iter().map(|text| serde_json::json!({"Text": text})).collect::<Vec<_>>());
+                if !region.is_empty() && region != "global" {
+                    request = request.header("Ocp-Apim-Subscription-Region", region);
+                }
+                request
+            }
+        };
+        let response = request.send().await.map_err(|_| "翻譯網路連線失敗")?;
         if let Err(summary) = check_status(&response, &api.translation_after).await {
             let status = response.status().as_u16();
             let body = response.json::<serde_json::Value>().await.ok();
-            return Err(api_error(status, &summary, body.as_ref(), key));
+            return Err(api_error(provider, status, &summary, body.as_ref(), key));
         }
-        let data: Response = response.json().await.map_err(|_| "翻譯服務回傳格式無效")?;
-        if data.data.translations.len() != range.len() {
-            return Err("翻譯行數不符，已保留原文".into());
-        }
-        for (index, translated) in range.zip(data.data.translations) {
-            result[indices[index]].translated =
-                Some(html_escape::decode_html_entities(&translated.translated_text).into_owned());
+        let body = response.json().await.map_err(|_| "翻譯服務回傳格式無效")?;
+        let translations = parse_translations(provider, body, range.len())?;
+        for (index, translated) in range.zip(translations) {
+            result[indices[index]].translated = Some(translated);
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     Ok(Lyrics::Synced { lines: result })
 }
 
+fn parse_translations(
+    provider: TranslationProvider,
+    body: serde_json::Value,
+    expected: usize,
+) -> Result<Vec<String>, String> {
+    let texts = match provider {
+        TranslationProvider::Google => {
+            let data: Response =
+                serde_json::from_value(body).map_err(|_| "翻譯服務回傳格式無效")?;
+            data.data
+                .translations
+                .into_iter()
+                .map(|t| html_escape::decode_html_entities(&t.translated_text).into_owned())
+                .collect::<Vec<_>>()
+        }
+        TranslationProvider::Azure => {
+            #[derive(Deserialize)]
+            struct Item {
+                translations: Vec<Text>,
+            }
+            #[derive(Deserialize)]
+            struct Text {
+                text: String,
+                to: String,
+            }
+            let items: Vec<Item> =
+                serde_json::from_value(body).map_err(|_| "翻譯服務回傳格式無效")?;
+            items
+                .into_iter()
+                .map(|item| {
+                    item.translations
+                        .into_iter()
+                        .find(|t| t.to == "zh-Hant")
+                        .map(|t| t.text)
+                        .ok_or("翻譯服務缺少繁體中文譯文".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
+    if texts.len() != expected {
+        return Err("翻譯行數不符，已保留原文".into());
+    }
+    Ok(texts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
+    fn azure_response_validation_and_key_redaction() {
+        let body =
+            serde_json::json!([{"translations":[{"text":"你好 &amp; 世界", "to":"zh-Hant"}]}]);
+        assert_eq!(
+            parse_translations(TranslationProvider::Azure, body.clone(), 1).unwrap(),
+            vec!["你好 &amp; 世界"]
+        );
+        assert!(parse_translations(TranslationProvider::Azure, body, 2).is_err());
+        assert!(parse_translations(
+            TranslationProvider::Azure,
+            serde_json::json!([{"translations":[]}]),
+            1
+        )
+        .is_err());
+        assert!(parse_translations(TranslationProvider::Azure, serde_json::json!({}), 1).is_err());
+        let body = serde_json::json!({"error":{"message":"invalid secret"}});
+        let error = api_error(
+            TranslationProvider::Azure,
+            401,
+            "驗證失敗",
+            Some(&body),
+            "secret",
+        );
+        assert!(error.contains("Azure"));
+        assert!(!error.contains("secret"));
+    }
+    #[test]
     fn api_errors_show_details_without_exposing_key() {
         let body = serde_json::json!({"error": {"message": "API key secret-key is invalid", "status": "INVALID_ARGUMENT"}});
-        let message = api_error(400, "API 請求失敗", Some(&body), "secret-key");
+        let message = api_error(
+            TranslationProvider::Google,
+            400,
+            "API 請求失敗",
+            Some(&body),
+            "secret-key",
+        );
         assert!(message.contains("HTTP 400"));
         assert!(message.contains("INVALID_ARGUMENT"));
         assert!(message.contains("is invalid"));
         assert!(!message.contains("secret-key"));
-        assert!(api_error(429, "請於 60 秒後重試", None, "key").contains("60 秒"));
-        assert!(
-            api_error(502, "API 請求失敗", Some(&serde_json::json!({})), "").contains("HTTP 502")
-        );
+        assert!(api_error(
+            TranslationProvider::Google,
+            429,
+            "請於 60 秒後重試",
+            None,
+            "key"
+        )
+        .contains("60 秒"));
+        assert!(api_error(
+            TranslationProvider::Google,
+            502,
+            "API 請求失敗",
+            Some(&serde_json::json!({})),
+            ""
+        )
+        .contains("HTTP 502"));
     }
 
     #[test]
@@ -142,12 +261,21 @@ mod tests {
             duration_ms: 1,
         };
         assert_ne!(
-            cache_key(&track, &Lyrics::Instrumental),
+            cache_key(&track, &Lyrics::Instrumental, TranslationProvider::Google),
+            cache_key(&track, &Lyrics::Instrumental, TranslationProvider::Azure)
+        );
+        assert!(
+            cache_key(&track, &Lyrics::Instrumental, TranslationProvider::Google)
+                .starts_with("google:v2:zh-TW:")
+        );
+        assert_ne!(
+            cache_key(&track, &Lyrics::Instrumental, TranslationProvider::Google),
             cache_key(
                 &track,
                 &Lyrics::Unsynced {
                     text: "own fixture".into()
-                }
+                },
+                TranslationProvider::Google
             )
         );
     }

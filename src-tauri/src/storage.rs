@@ -1,4 +1,4 @@
-use crate::model::{Lyrics, Settings};
+use crate::model::{Lyrics, Settings, TranslationProvider};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{path::Path, sync::Mutex};
 
@@ -106,10 +106,10 @@ impl Storage {
 }
 
 #[cfg(target_os = "macos")]
-pub fn read_key() -> Result<Option<String>, String> {
+pub fn read_key(provider: TranslationProvider) -> Result<Option<String>, String> {
     match security_framework::passwords::get_generic_password(
         "app.spotify-lyrics-translator.desktop",
-        "google-translation-v2",
+        provider.account(),
     ) {
         Ok(bytes) => String::from_utf8(bytes)
             .map(Some)
@@ -119,31 +119,28 @@ pub fn read_key() -> Result<Option<String>, String> {
     }
 }
 #[cfg(target_os = "macos")]
-pub fn write_key(key: &str) -> Result<(), String> {
+pub fn write_key(provider: TranslationProvider, key: &str) -> Result<(), String> {
     use security_framework::passwords::{delete_generic_password, set_generic_password};
     let result = if key.is_empty() {
-        match delete_generic_password(
-            "app.spotify-lyrics-translator.desktop",
-            "google-translation-v2",
-        ) {
+        match delete_generic_password("app.spotify-lyrics-translator.desktop", provider.account()) {
             Err(e) if e.code() == -25300 => Ok(()),
             other => other,
         }
     } else {
         set_generic_password(
             "app.spotify-lyrics-translator.desktop",
-            "google-translation-v2",
+            provider.account(),
             key.as_bytes(),
         )
     };
     result.map_err(|_| "無法更新 Keychain".into())
 }
 #[cfg(not(target_os = "macos"))]
-pub fn read_key() -> Result<Option<String>, String> {
+pub fn read_key(provider: TranslationProvider) -> Result<Option<String>, String> {
     Err("目前只支援 macOS Keychain".into())
 }
 #[cfg(not(target_os = "macos"))]
-pub fn write_key(_: &str) -> Result<(), String> {
+pub fn write_key(_provider: TranslationProvider, _: &str) -> Result<(), String> {
     Err("目前只支援 macOS Keychain".into())
 }
 
@@ -179,6 +176,55 @@ mod tests {
         db.put("choices", &Lyrics::Candidates { candidates: vec![] })
             .unwrap();
         assert!(db.get("choices").unwrap().is_none());
+    }
+
+    #[test]
+    fn old_settings_default_to_google_and_azure_settings_persist() {
+        let old: Settings = serde_json::from_str(r#"{"opacity":0.8}"#).unwrap();
+        assert_eq!(old.translation_provider, TranslationProvider::Google);
+        assert!(old.azure_region.is_empty());
+        let db = Storage::open(Path::new(":memory:")).unwrap();
+        let mut settings = Settings {
+            translation_provider: TranslationProvider::Azure,
+            azure_region: "eastasia".into(),
+            ..old
+        };
+        db.save_settings(&settings).unwrap();
+        assert_eq!(
+            db.settings().unwrap().translation_provider,
+            TranslationProvider::Azure
+        );
+        assert_eq!(db.settings().unwrap().azure_region, "eastasia");
+        assert_ne!(
+            TranslationProvider::Google.account(),
+            TranslationProvider::Azure.account()
+        );
+        settings.azure_region = "eastasia\r\nheader".into();
+        assert!(db.save_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn lyric_colors_default_validate_and_persist() {
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(settings.subtitle_background);
+        settings.subtitle_background = false;
+        assert_eq!(settings.original_color, "#e8eee9");
+        assert_eq!(settings.translated_color, "#b0edc3");
+        settings.original_color = "#FF0000".into();
+        settings.translated_color = "#123abc".into();
+        let db = Storage::open(Path::new(":memory:")).unwrap();
+        db.save_settings(&settings).unwrap();
+        assert!(!db.settings().unwrap().subtitle_background);
+        assert_eq!(db.settings().unwrap().original_color, "#FF0000");
+        assert_eq!(db.settings().unwrap().translated_color, "#123abc");
+        for invalid in ["", "red", "#123", "#gggggg", "#12345678", "#１２"] {
+            settings.original_color = invalid.into();
+            assert!(settings.validate().is_err());
+            settings.original_color = "#ffffff".into();
+            settings.translated_color = invalid.into();
+            assert!(settings.validate().is_err());
+            settings.translated_color = "#000000".into();
+        }
     }
 
     #[test]

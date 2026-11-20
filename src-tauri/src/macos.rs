@@ -1,19 +1,26 @@
 use crate::{model::Settings, Shared};
-use objc2::{define_class, msg_send, rc::Retained, MainThreadMarker, MainThreadOnly};
+use objc2::{
+    define_class, msg_send, rc::Retained, sel, DefinedClass, MainThreadMarker, MainThreadOnly,
+};
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSColor, NSEvent, NSEventType, NSFloatingWindowLevel,
     NSNormalWindowLevel, NSPanel, NSScreen, NSWindow, NSWindowCollectionBehavior as Behavior,
-    NSWindowStyleMask,
+    NSWindowDidMoveNotification, NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect};
+use objc2_foundation::{NSNotification, NSNotificationCenter, NSPoint, NSRect};
 use std::cell::RefCell;
 use tauri::Manager;
 
 define_class!(
     #[unsafe(super = NSPanel)]
     #[thread_kind = MainThreadOnly]
+    #[ivars = tauri::AppHandle]
     struct LyricsPanel;
     impl LyricsPanel {
+        #[unsafe(method(lyricsPanelDidMove:))]
+        fn did_move(&self, _notification: &NSNotification) {
+            save_position(self.ivars(), self);
+        }
         #[unsafe(method(canBecomeKeyWindow))]
         fn can_become_key(&self) -> bool { false }
         #[unsafe(method(canBecomeMainWindow))]
@@ -37,10 +44,10 @@ fn panel_behavior(modern: bool) -> Behavior {
 fn fits_screen(origin: NSPoint, screen: NSRect, size: objc2_foundation::NSSize) -> bool {
     origin.x.is_finite()
         && origin.y.is_finite()
-        && origin.x >= screen.origin.x
-        && origin.y >= screen.origin.y
-        && origin.x + size.width <= screen.origin.x + screen.size.width
-        && origin.y + size.height <= screen.origin.y + screen.size.height
+        && origin.x + size.width > screen.origin.x + 40.0
+        && origin.x < screen.origin.x + screen.size.width - 40.0
+        && origin.y + size.height > screen.origin.y + 40.0
+        && origin.y + size.height <= screen.origin.y + screen.size.height + 1.0
 }
 
 pub fn configure_overlay(
@@ -52,7 +59,7 @@ pub fn configure_overlay(
     // Tauri keeps ownership of the hidden host and webview for IPC and shutdown.
     let original = unsafe { (pointer as *const NSWindow).as_ref() }.ok_or("找不到原生浮窗")?;
     let content = original.contentView().ok_or("找不到歌詞畫面")?;
-    let allocated = LyricsPanel::alloc(mtm).set_ivars(());
+    let allocated = LyricsPanel::alloc(mtm).set_ivars(window.app_handle().clone());
     // Create a real panel with nonactivation enabled from birth, rather than changing a window's class.
     let panel: Retained<LyricsPanel> = unsafe {
         msg_send![super(allocated), initWithContentRect: original.frame(),
@@ -74,7 +81,7 @@ pub fn configure_overlay(
         let origin = NSPoint::new(x, y);
         if NSScreen::screens(mtm)
             .iter()
-            .any(|screen| fits_screen(origin, screen.visibleFrame(), panel.frame().size))
+            .any(|screen| fits_screen(origin, screen.frame(), panel.frame().size))
         {
             panel.setFrameOrigin(origin);
         } else {
@@ -84,6 +91,15 @@ pub fn configure_overlay(
     original.setContentView(None);
     panel.setContentView(Some(&content));
     original.orderOut(None);
+    // Native dragging can finish after performWindowDragWithEvent returns.
+    unsafe {
+        NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+            &panel,
+            sel!(lyricsPanelDidMove:),
+            Some(NSWindowDidMoveNotification),
+            Some(&panel),
+        );
+    }
     PANEL.with(|slot| *slot.borrow_mut() = Some(panel));
     Ok(())
 }
@@ -166,6 +182,8 @@ mod tests {
         let size = NSSize::new(540.0, 120.0);
         assert!(fits_screen(NSPoint::new(-1000.0, 400.0), screen, size));
         assert!(!fits_screen(NSPoint::new(0.0, 0.0), screen, size));
+        assert!(fits_screen(NSPoint::new(-1000.0, -50.0), screen, size));
+        assert!(!fits_screen(NSPoint::new(-1000.0, -120.0), screen, size));
         assert!(!fits_screen(NSPoint::new(f64::NAN, 0.0), screen, size));
     }
 }

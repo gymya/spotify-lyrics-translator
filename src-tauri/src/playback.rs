@@ -54,6 +54,25 @@ tell application id "com.spotify.client" to {}
     execute(&script).await.map(|_| ())
 }
 
+fn seek_command(position_ms: u64, duration_ms: u64) -> Result<String, String> {
+    if duration_ms == 0 || position_ms > duration_ms {
+        return Err("播放位置超出歌曲範圍".into());
+    }
+    Ok(format!(
+        "set player position to {}.{:03}",
+        position_ms / 1000,
+        position_ms % 1000
+    ))
+}
+
+pub async fn seek(position_ms: u64, duration_ms: u64) -> Result<(), String> {
+    let command = seek_command(position_ms, duration_ms)?;
+    execute(&format!(r#"
+if not (application id "com.spotify.client" is running) then error "Spotify is not running" number -600
+tell application id "com.spotify.client" to {command}
+"#)).await.map(|_| ())
+}
+
 impl PlaybackProvider for Spotify {
     async fn get_state(&self) -> Result<Playback, String> {
         parse(&execute(SCRIPT).await?)
@@ -138,6 +157,19 @@ fn parse(raw: &str) -> Result<Playback, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn seek_checks_bounds_and_converts_milliseconds() {
+        assert_eq!(
+            seek_command(12550, 180000).unwrap(),
+            "set player position to 12.550"
+        );
+        assert_eq!(
+            seek_command(0, 180000).unwrap(),
+            "set player position to 0.000"
+        );
+        assert!(seek_command(180001, 180000).is_err());
+        assert!(seek_command(0, 0).is_err());
+    }
     #[test]
     fn controls_only_allow_supported_spotify_commands() {
         for (input, command) in [

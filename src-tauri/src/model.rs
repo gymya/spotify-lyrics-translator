@@ -72,11 +72,31 @@ pub enum Lyrics {
     Candidates { candidates: Vec<Candidate> },
     Error { message: String },
 }
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranslationProvider {
+    #[default]
+    Google,
+    Azure,
+}
+impl TranslationProvider {
+    pub fn account(self) -> &'static str {
+        match self {
+            Self::Google => "google-translation-v2",
+            Self::Azure => "azure-translator-v3",
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
+    pub translation_provider: TranslationProvider,
+    pub azure_region: String,
     pub opacity: f64,
     pub font_size: u32,
+    pub original_color: String,
+    pub translated_color: String,
+    pub subtitle_background: bool,
     pub offset_ms: i64,
     pub click_through: bool,
     pub always_on_top: bool,
@@ -89,8 +109,13 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            translation_provider: TranslationProvider::Google,
+            azure_region: String::new(),
             opacity: 0.92,
             font_size: 26,
+            original_color: "#e8eee9".into(),
+            translated_color: "#b0edc3".into(),
+            subtitle_background: true,
             offset_ms: 0,
             click_through: true,
             always_on_top: true,
@@ -104,7 +129,19 @@ impl Default for Settings {
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
-        if self.panel_x.is_some_and(|x| !x.is_finite())
+        if [&self.original_color, &self.translated_color]
+            .iter()
+            .any(|color| {
+                color.len() != 7
+                    || !color.starts_with('#')
+                    || !color.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+            })
+            || self.azure_region.len() > 64
+            || !self
+                .azure_region
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+            || self.panel_x.is_some_and(|x| !x.is_finite())
             || self.panel_y.is_some_and(|y| !y.is_finite())
             || !self.opacity.is_finite()
             || !(0.1..=1.0).contains(&self.opacity)
