@@ -1,5 +1,5 @@
 use crate::{
-    lyrics::{check_status, reserve, Api},
+    lyrics::{Api, ApiResponse},
     model::{hash, Lyrics, Track, TranslationProvider},
 };
 use serde::Deserialize;
@@ -103,7 +103,6 @@ pub async fn translate(
         .collect();
     let texts: Vec<String> = indices.iter().map(|&i| lines[i].original.clone()).collect();
     for range in batches(&texts)? {
-        reserve(&api.translation_after).await?;
         let request = match provider {
             TranslationProvider::Google => api.client.post("https://translation.googleapis.com/language/translate/v2")
                 .header("X-Goog-Api-Key", key)
@@ -119,13 +118,22 @@ pub async fn translate(
                 request
             }
         };
-        let response = request.send().await.map_err(|_| "翻譯網路連線失敗")?;
-        if let Err(summary) = check_status(&response, &api.translation_after).await {
-            let status = response.status().as_u16();
-            let body = response.json::<serde_json::Value>().await.ok();
-            return Err(api_error(provider, status, &summary, body.as_ref(), key));
-        }
-        let body = response.json().await.map_err(|_| "翻譯服務回傳格式無效")?;
+        let body = match api
+            .send_json(
+                request,
+                &api.translation_after,
+                "翻譯網路連線失敗",
+                "翻譯服務回傳格式無效",
+            )
+            .await?
+        {
+            ApiResponse::Success(body) => body,
+            ApiResponse::HttpError { response, message } => {
+                let status = response.status().as_u16();
+                let body = response.json::<serde_json::Value>().await.ok();
+                return Err(api_error(provider, status, &message, body.as_ref(), key));
+            }
+        };
         let translations = parse_translations(provider, body, range.len())?;
         for (index, translated) in range.zip(translations) {
             result[indices[index]].translated = Some(translated);
