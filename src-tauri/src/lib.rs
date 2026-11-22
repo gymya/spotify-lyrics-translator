@@ -116,8 +116,21 @@ fn save_settings(
     settings.y = data.settings.y;
     settings.panel_x = data.settings.panel_x;
     settings.panel_y = data.settings.panel_y;
-    apply_overlay(&app, &settings, data.editing)?;
-    state.db.save_settings(&settings)?;
+    settings.overlay_enabled = data.settings.overlay_enabled;
+    update_settings(&app, &state, &mut data, settings)
+}
+
+fn update_settings(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    data: &mut Runtime,
+    settings: Settings,
+) -> Result<(), String> {
+    apply_overlay(app, &settings, data.editing)?;
+    if let Err(error) = state.db.save_settings(&settings) {
+        let _ = apply_overlay(app, &data.settings, data.editing);
+        return Err(error);
+    }
     if data.settings.translation_provider != settings.translation_provider
         || data.settings.azure_region != settings.azure_region
     {
@@ -126,6 +139,24 @@ fn save_settings(
     }
     data.settings = settings;
     Ok(())
+}
+
+fn change_overlay_visibility(app: &tauri::AppHandle, enabled: Option<bool>) -> Result<(), String> {
+    let state = app.state::<Shared>();
+    let mut data = state.data.lock().unwrap();
+    let mut settings = data.settings.clone();
+    settings.overlay_enabled = enabled.unwrap_or(!settings.overlay_enabled);
+    update_settings(app, &state, &mut data, settings)
+}
+
+#[tauri::command]
+fn set_overlay_visibility(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
+    main_only(&window)?;
+    change_overlay_visibility(&app, Some(enabled))
 }
 
 fn edit_overlay(app: &tauri::AppHandle, editing: bool) -> Result<(), String> {
@@ -200,7 +231,7 @@ async fn search_lyrics(
         data.search_results = None;
         (track, data.generation)
     };
-    let result = lyrics::search(&state.api, &track).await?;
+    let result = lyrics::search(&state.api, &track, lyrics::RequestKind::ManualLyrics).await?;
     finish_lyric_search(&mut state.data.lock().unwrap(), generation, result)
 }
 
@@ -525,6 +556,7 @@ pub fn run() {
             get_snapshot,
             clear_local_data,
             save_settings,
+            set_overlay_visibility,
             set_editing,
             drag_overlay,
             retry,
@@ -597,26 +629,48 @@ pub fn run() {
             }
             let settings_item =
                 MenuItem::with_id(app, "settings", "設定與播放狀態", true, None::<&str>)?;
+            let overlay_item = MenuItem::with_id(
+                app,
+                "toggle_overlay",
+                "切換顯示懸浮視窗",
+                true,
+                None::<&str>,
+            )?;
             let move_item =
                 MenuItem::with_id(app, "move", "切換浮動視窗調整模式", true, None::<&str>)?;
             let retry_item = MenuItem::with_id(app, "retry", "重試歌詞與翻譯", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "結束", true, None::<&str>)?;
-            let menu =
-                Menu::with_items(app, &[&settings_item, &move_item, &retry_item, &quit_item])?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &overlay_item,
+                    &settings_item,
+                    &move_item,
+                    &retry_item,
+                    &quit_item,
+                ],
+            )?;
             let mut pixels = vec![0u8; 18 * 18 * 4];
             for (row, width) in [(4, 14), (8, 10), (12, 12)] {
                 for y in row..row + 2 {
                     for x in 2..width + 2 {
-                        pixels[(y * 18 + x) * 4 + 3] = 255;
+                        let offset = (y * 18 + x) * 4;
+                        pixels[offset..offset + 4].fill(255);
                     }
                 }
             }
             TrayIconBuilder::new()
                 .icon(tauri::image::Image::new_owned(pixels, 18, 18))
-                .icon_as_template(true)
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "settings" => show_settings(app),
+                    "toggle_overlay" => {
+                        if let Err(message) = change_overlay_visibility(app, None) {
+                            app.state::<Shared>().data.lock().unwrap().translation_message =
+                                Some(format!("無法切換懸浮視窗：{message}"));
+                            show_settings(app);
+                        }
+                    }
                     "move" => {
                         let editing = !app.state::<Shared>().data.lock().unwrap().editing;
                         if edit_overlay(app, editing).is_err() {

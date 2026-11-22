@@ -1,5 +1,5 @@
 use crate::{
-    lyrics::{Api, ApiResponse},
+    lyrics::{Api, ApiResponse, RequestKind},
     model::{hash, Lyrics, Track, TranslationProvider},
 };
 use serde::Deserialize;
@@ -121,7 +121,7 @@ pub async fn translate(
         let body = match api
             .send_json(
                 request,
-                &api.translation_after,
+                RequestKind::Translation,
                 "翻譯網路連線失敗",
                 "翻譯服務回傳格式無效",
             )

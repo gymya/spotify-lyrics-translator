@@ -70,6 +70,12 @@ async function action(command: string, args?: Record<string, unknown>, success =
   catch (error) { notice.value = String(error); return false }
   finally { busy.value = false }
 }
+async function setOverlayVisibility(event: Event) {
+  const input = event.target as HTMLInputElement
+  if (!await action('set_overlay_visibility', { enabled: input.checked })) {
+    input.checked = s.value?.settings.overlayEnabled ?? false
+  }
+}
 watch(() => track.value?.id, () => { choosingLyrics.value = false; searchedCandidates.value = [] })
 watch(() => s.value?.lyrics?.kind, kind => {
   if (kind === 'candidates') choosingLyrics.value = true
@@ -188,7 +194,7 @@ onUnmounted(app.stop)
       <section class="card">
         <div class="section-heading"><h2>浮動歌詞</h2><span class="eyebrow">OVERLAY</span></div>
         <template v-if="draft">
-          <label class="toggle-row"><span>顯示浮動視窗</span><input v-model="draft.overlayEnabled" type="checkbox"></label>
+          <label class="toggle-row"><span>顯示浮動視窗</span><input :checked="s?.settings.overlayEnabled" :disabled="busy || !s" type="checkbox" @change="setOverlayVisibility"></label>
           <label class="range-label" for="opacity">不透明度 <span>{{ Math.round(draft.opacity * 100) }}%</span></label>
           <input id="opacity" v-model.number="draft.opacity" type="range" min="0.1" max="1" step="0.01">
           <label class="range-label" for="font">字體大小 <span>{{ draft.fontSize }} px</span></label>

@@ -6,16 +6,38 @@ use tokio::sync::Mutex;
 
 const MAX_RETRIES: usize = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+const REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 
 pub enum ApiResponse<T> {
     Success(T),
     HttpError { response: Response, message: String },
 }
 
+pub enum RequestKind {
+    AutomaticLyrics,
+    ManualLyrics,
+    Translation,
+}
+
+struct RequestGate {
+    next_request: Instant,
+    server_retry_at: Instant,
+}
+
+impl RequestGate {
+    fn new() -> Mutex<Self> {
+        let now = Instant::now();
+        Mutex::new(Self {
+            next_request: now,
+            server_retry_at: now,
+        })
+    }
+}
+
 pub struct Api {
     pub client: reqwest::Client,
-    pub lyrics_after: Mutex<Instant>,
-    pub translation_after: Mutex<Instant>,
+    lyrics_gate: Mutex<RequestGate>,
+    translation_gate: Mutex<RequestGate>,
 }
 impl Api {
     pub fn new() -> Result<Self, reqwest::Error> {
@@ -27,23 +49,27 @@ impl Api {
                 .timeout(Duration::from_secs(25))
                 .retry(reqwest::retry::never())
                 .build()?,
-            lyrics_after: Mutex::new(Instant::now()),
-            translation_after: Mutex::new(Instant::now()),
+            lyrics_gate: RequestGate::new(),
+            translation_gate: RequestGate::new(),
         })
     }
 
     pub async fn send_json<T: DeserializeOwned>(
         &self,
         request: RequestBuilder,
-        gate: &Mutex<Instant>,
+        kind: RequestKind,
         network_error: &str,
         format_error: &str,
     ) -> Result<ApiResponse<T>, String> {
         let request = request.build().map_err(|_| network_error)?;
         let read_only = request.method() == Method::GET;
+        let gate = match kind {
+            RequestKind::AutomaticLyrics | RequestKind::ManualLyrics => &self.lyrics_gate,
+            RequestKind::Translation => &self.translation_gate,
+        };
         let mut remaining = MAX_RETRIES;
         loop {
-            reserve(gate).await?;
+            reserve(gate, matches!(kind, RequestKind::AutomaticLyrics)).await?;
             let attempt_request = request.try_clone().ok_or(network_error)?;
             match self.client.execute(attempt_request).await {
                 Ok(response) if response.status().is_success() => match response.json().await {
@@ -76,7 +102,7 @@ impl Api {
     }
 }
 
-async fn http_failure(response: &Response, gate: &Mutex<Instant>) -> (String, bool) {
+async fn http_failure(response: &Response, gate: &Mutex<RequestGate>) -> (String, bool) {
     let status = response.status();
     let message = format!("API 請求失敗（HTTP {}）", status.as_u16());
     if !matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504) {
@@ -107,8 +133,8 @@ async fn http_failure(response: &Response, gate: &Mutex<Instant>) -> (String, bo
     let until = now
         .checked_add(delay)
         .unwrap_or(now + Duration::from_secs(86400));
-    let mut next = gate.lock().await;
-    *next = (*next).max(until);
+    let mut gate = gate.lock().await;
+    gate.server_retry_at = gate.server_retry_at.max(until);
     let seconds = delay.as_secs() + u64::from(delay.subsec_nanos() > 0);
     (
         format!("服務暫時忙碌，請於 {seconds} 秒後重試"),
@@ -116,17 +142,24 @@ async fn http_failure(response: &Response, gate: &Mutex<Instant>) -> (String, bo
     )
 }
 
-async fn reserve(gate: &Mutex<Instant>) -> Result<(), String> {
-    let mut next = gate.lock().await;
-    let now = Instant::now();
-    if *next > now {
-        return Err(format!(
-            "請於 {} 秒後重試",
-            next.duration_since(now).as_secs() + 1
-        ));
+async fn reserve(gate: &Mutex<RequestGate>, wait_for_interval: bool) -> Result<(), String> {
+    loop {
+        let mut state = gate.lock().await;
+        let now = Instant::now();
+        let next = state.next_request.max(state.server_retry_at);
+        if next <= now {
+            state.next_request = now + REQUEST_INTERVAL;
+            return Ok(());
+        }
+        if !wait_for_interval || state.server_retry_at > now {
+            return Err(format!(
+                "請於 {} 秒後重試",
+                next.duration_since(now).as_secs() + 1
+            ));
+        }
+        drop(state);
+        tokio::time::sleep_until(next.into()).await;
     }
-    *next = now + Duration::from_secs(1);
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -167,7 +200,7 @@ pub async fn fetch(api: &Api, track: &Track) -> Result<Lyrics, String> {
     let record: Record = match api
         .send_json(
             request,
-            &api.lyrics_after,
+            RequestKind::AutomaticLyrics,
             "歌詞網路連線失敗，請稍後再試",
             "歌詞服務回傳格式無效",
         )
@@ -175,12 +208,12 @@ pub async fn fetch(api: &Api, track: &Track) -> Result<Lyrics, String> {
     {
         ApiResponse::Success(record) => record,
         ApiResponse::HttpError { response, .. } if response.status() == StatusCode::NOT_FOUND => {
-            return search_fallback(api, track).await;
+            return search(api, track, RequestKind::AutomaticLyrics).await;
         }
         ApiResponse::HttpError { message, .. } => return Err(message),
     };
     if !matching(&record, track) {
-        return search_fallback(api, track).await;
+        return search(api, track, RequestKind::AutomaticLyrics).await;
     }
     Ok(record_lyrics(record))
 }
@@ -201,12 +234,7 @@ fn record_lyrics(record: Record) -> Lyrics {
     }
 }
 
-async fn search_fallback(api: &Api, track: &Track) -> Result<Lyrics, String> {
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    search(api, track).await
-}
-
-pub async fn search(api: &Api, track: &Track) -> Result<Lyrics, String> {
+pub async fn search(api: &Api, track: &Track, kind: RequestKind) -> Result<Lyrics, String> {
     let request = api
         .client
         .get("https://lrclib.net/api/search")
@@ -214,7 +242,7 @@ pub async fn search(api: &Api, track: &Track) -> Result<Lyrics, String> {
     match api
         .send_json(
             request,
-            &api.lyrics_after,
+            kind,
             "歌詞搜尋連線失敗，請稍後再試",
             "歌詞搜尋回傳格式無效",
         )
@@ -386,6 +414,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_lyrics_wait_for_request_interval_after_cancelled_lookup() {
+        let (url, server) = serve_responses(&[
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            2
+        ]);
+        let api = Api::new().unwrap();
+        let lookup = || {
+            api.send_json::<serde_json::Value>(
+                api.client.get(&url),
+                RequestKind::AutomaticLyrics,
+                "network",
+                "format",
+            )
+        };
+        let started = Instant::now();
+        assert!(matches!(lookup().await, Ok(ApiResponse::Success(_))));
+        assert!(tokio::time::timeout(Duration::from_millis(25), lookup())
+            .await
+            .is_err());
+        assert!(matches!(lookup().await, Ok(ApiResponse::Success(_))));
+
+        let received = server.join().unwrap();
+        assert!(received[1] - started >= REQUEST_INTERVAL);
+    }
+
+    #[tokio::test]
     async fn retries_transient_failures_three_times_with_five_second_delays() {
         let (url, server) = serve_responses(&[
             "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -395,7 +449,7 @@ mod tests {
         let result = api
             .send_json::<serde_json::Value>(
                 api.client.get(url),
-                &api.lyrics_after,
+                RequestKind::AutomaticLyrics,
                 "network",
                 "format",
             )
@@ -420,7 +474,7 @@ mod tests {
         let result = api
             .send_json::<serde_json::Value>(
                 api.client.get(url),
-                &api.lyrics_after,
+                RequestKind::AutomaticLyrics,
                 "network",
                 "format",
             )
@@ -430,7 +484,7 @@ mod tests {
             Ok(ApiResponse::HttpError { response, message })
                 if response.status() == StatusCode::TOO_MANY_REQUESTS && message.contains("30 秒")
         ));
-        assert!(reserve(&api.lyrics_after).await.is_err());
+        assert!(reserve(&api.lyrics_gate, true).await.is_err());
         server.join().unwrap();
     }
 
