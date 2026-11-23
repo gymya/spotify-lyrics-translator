@@ -276,6 +276,24 @@ mod tests {
     }
 
     #[test]
+    fn lyric_visibility_defaults_and_each_combination_persist() {
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(settings.show_original && settings.show_translation);
+        let db = Storage::open(Path::new(":memory:")).unwrap();
+        for (original, translation) in [(true, false), (false, true), (false, false), (true, true)]
+        {
+            settings.show_original = original;
+            settings.show_translation = translation;
+            db.save_settings(&settings).unwrap();
+            let saved = db.settings().unwrap();
+            assert_eq!(
+                (saved.show_original, saved.show_translation),
+                (original, translation)
+            );
+        }
+    }
+
+    #[test]
     fn lyric_colors_default_validate_and_persist() {
         let mut settings: Settings = serde_json::from_str("{}").unwrap();
         assert!(settings.subtitle_background);

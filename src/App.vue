@@ -48,6 +48,8 @@ async function refreshKeyStatus() {
   } catch (error) { notice.value = String(error) }
 }
 const track = computed(() => s.value?.playback.track)
+const showOriginal = computed(() => (overlay ? s.value?.settings.showOriginal : draft.value?.showOriginal ?? s.value?.settings.showOriginal) ?? true)
+const showTranslation = computed(() => (overlay ? s.value?.settings.showTranslation : draft.value?.showTranslation ?? s.value?.settings.showTranslation) ?? true)
 const previewStyle = computed(() => ({ '--subtitle-background': (draft.value?.subtitleBackground ?? s.value?.settings.subtitleBackground ?? true) ? 'rgb(0 0 0 / 70%)' : 'transparent', '--original-color': draft.value?.originalColor ?? s.value?.settings.originalColor, '--translated-color': draft.value?.translatedColor ?? s.value?.settings.translatedColor, opacity: draft.value?.opacity ?? s.value?.settings.opacity ?? 0.92, fontSize: `${draft.value?.fontSize ?? s.value?.settings.fontSize ?? 26}px` }))
 const overlayStyle = computed(() => ({ '--subtitle-background': (s.value?.settings.subtitleBackground ?? true) ? 'rgb(0 0 0 / 70%)' : 'transparent', '--original-color': s.value?.settings.originalColor, '--translated-color': s.value?.settings.translatedColor, opacity: s.value?.settings.opacity ?? 0.92, fontSize: `${s.value?.settings.fontSize ?? 26}px` }))
 function time(ms: number) { const seconds = Math.floor(ms / 1000); return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` }
@@ -133,8 +135,8 @@ onUnmounted(app.stop)
     <div v-if="s?.editing" class="drag-label">拖曳調整位置</div>
     <div class="lyric-pair" :style="overlayStyle">
       <template v-if="s?.line && !app.error">
-        <p class="original">{{ s.line.original }}</p>
-        <p class="translated">{{ s.line.translated || (s.translating ? '正在翻譯歌詞…' : '') }}</p>
+        <p v-if="showOriginal" class="original">{{ s.line.original }}</p>
+        <p v-if="showTranslation" class="translated">{{ s.line.translated || (s.translating ? '正在翻譯歌詞…' : '') }}</p>
       </template>
       <p v-else class="status-text">{{ app.error || app.message }}</p>
     </div>
@@ -167,7 +169,7 @@ onUnmounted(app.stop)
       <div class="flex justify-between time-label"><span>{{ time(position) }}</span><span>{{ time(track?.durationMs || 0) }}</span></div>
       <div class="preview lyric-pair" :style="previewStyle">
         <p v-if="switching" class="status-text" role="status">{{ switching }}</p>
-        <template v-else-if="s?.line"><p class="original">{{ s.line.original || '♪' }}</p><p class="translated">{{ s.line.translated || (s.translating ? '正在翻譯歌詞…' : '') }}</p></template>
+        <template v-else-if="s?.line"><p v-if="showOriginal" class="original">{{ s.line.original || '♪' }}</p><p v-if="showTranslation" class="translated">{{ s.line.translated || (s.translating ? '正在翻譯歌詞…' : '') }}</p></template>
         <p v-else class="status-text">{{ app.error || app.message }}</p>
       </div>
       <div class="flex items-center justify-between gap-3"><p class="small muted">{{ s?.translationMessage || (s?.translating ? '正在翻譯歌詞…' : `LRCLIB 歌詞 · ${serviceName} · 繁體中文`) }}</p><button :disabled="busy || !app.desktop" class="text-button shrink-0" @click="action('retry', undefined, '已安排重新載入')">重新載入 ↻</button></div>
@@ -200,6 +202,8 @@ onUnmounted(app.stop)
           <label class="range-label" for="font">字體大小 <span>{{ draft.fontSize }} px</span></label>
           <input id="font" v-model.number="draft.fontSize" type="range" min="14" max="48" step="1">
           <label class="toggle-row"><span>顯示半透明黑底</span><input v-model="draft.subtitleBackground" type="checkbox"></label>
+          <label class="toggle-row"><span>顯示原文歌詞</span><input v-model="draft.showOriginal" type="checkbox"></label>
+          <label class="toggle-row"><span>顯示翻譯歌詞</span><input v-model="draft.showTranslation" type="checkbox"></label>
           <label class="toggle-row"><span>原文字體顏色</span><input v-model="draft.originalColor" type="color"></label>
           <label class="toggle-row"><span>譯文字體顏色</span><input v-model="draft.translatedColor" type="color"></label>
           <label class="range-label" for="offset">時間偏移 <span>{{ draft.offsetMs > 0 ? '+' : '' }}{{ draft.offsetMs }} ms</span></label>

@@ -73,3 +73,5 @@ footer { display: flex; justify-content: space-between; gap: 12px; font-size: 10
 
 .playback-button { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; padding: 10px; border-radius: 50%; }
 .playback-button svg { width: 22px; height: 22px; fill: currentColor; }
+
+.lyric-pair .translated:first-child { margin-top: 0; }
